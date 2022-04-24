@@ -17,6 +17,7 @@ def store_user_redis(partition):
     client = redis.StrictRedis(host="localhost", port=6379, password="123456", db=10)
     for r in partition:
         data = {
+            "cms_segid": r.cms_segid,
             "cms_group_id": r.cms_group_id,
             "final_gender_code": r.final_gender_code,
             "age_level": r.age_level,
@@ -44,7 +45,7 @@ spark = SparkSession.builder.config(conf=conf).getOrCreate()
 
 # 先将广告ad和用户特征缓存到redis中
 feature_cols_from_ad = ["price"]
-feature_cols_from_user = ["cms_group_id", "final_gender_code", "age_level", "shopping_level", "occupation",
+feature_cols_from_user = ["cms_segid", "cms_group_id", "final_gender_code", "age_level", "shopping_level", "occupation",
                           "pvalue_level", "new_user_class_level"]
 
 # 加载ad_feature.csv数据

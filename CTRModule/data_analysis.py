@@ -81,7 +81,7 @@ new_df = pipeline_model.transform(df)
 
 # 对new_user_class_level进行onehot编码
 stringindexer = StringIndexer(inputCol="new_user_class_level", outputCol="nucl_onehot_feature")
-encoder = OneHotEncoder(dropLast=False, inputCol="pl_onehot_feature", outputCol="nucl_onehot_value")
+encoder = OneHotEncoder(dropLast=False, inputCol="nucl_onehot_feature", outputCol="nucl_onehot_value")
 pipeline = Pipeline(stages=[stringindexer, encoder])
 pipeline_model = pipeline.fit(new_df)
 user_profile_df = pipeline_model.transform(new_df)
