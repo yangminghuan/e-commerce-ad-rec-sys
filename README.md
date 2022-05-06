@@ -53,7 +53,7 @@ hadoop fs -put ./dataset /recsys
 hadoop fs -ls /recsys/dataset
 ```
 
-### 根据用户行为数据创建ALS模型并召回广告
+### 根据用户行为数据创建ALS模型并召回广告（离线召回模块）
 1.创建spark session
 ```
 from pyspark import SparkConf
@@ -143,6 +143,152 @@ recall_result = als_model.recommendForAllUsers(5)
 recall_result.foreachPartition(recall_cate_by_cf)
 ```
 
-6.同理，根据以上步骤可以进行用户对广告品牌brand偏好打分训练ALS模型，并召回相关的结果进行缓存
+6.根据用户喜好的广告类别找到对应的商品进行召回并缓存到redis中
+```
+# 加载ad_feature.csv数据
+schema = StructType([
+    StructField("adgroup_id", IntegerType()),
+    StructField("cate_id", IntegerType()),
+    StructField("campaign_id", IntegerType()),
+    StructField("customer", IntegerType()),
+    StructField("brand", IntegerType()),
+    StructField("price", FloatType())
+])
+df = spark.read.csv("hdfs://localhost:9000/recsys/dataset/ad_feature.csv", header=True, schema=schema)
+df = df.replace("NULL", "-1")
+ad_feature_df = df.withColumnRenamed("adgroup_id", "adgroupId").withColumnRenamed("cate_id", "cateId").\
+    withColumnRenamed("campaign_id", "campaignId").withColumnRenamed("customer", "customerId").\
+    withColumnRenamed("brand", "brandId")
+ad_cate_df = ad_feature_df.select("adgroupId", "cateId").toPandas()
+# 利用基于商品类别的ALS模型进行召回
+# 加载ALS模型
+als_model = ALSModel.load("hdfs://localhost:9000/recsys/models/userCateRatingALSModel.obj")
+# 存储用户召回的商品id，使用redis第9号数据库，类型：sets类型
+client = redis.StrictRedis(host="localhost", port=6379, password="123456", db=9)
+# 循环遍历每一个用户，召回商品id并存储
+for r in als_model.userFactors.select("id").collect():
+    userId = r.id
+    cateId_df = pd.DataFrame(ad_cate_df["cateId"].unique(), columns=["cateId"])
+    cateId_df.insert(0, "userId", np.array([userId for i in range(6769)]))
+    ret = set()
+    # 利用ALS模型求用户对所有商品类别的兴趣程度
+    cateId_list = als_model.transform(spark.createDataFrame(cateId_df)).sort("prediction", ascending=False).na.drop()
+    # 从前10个分类中选出500个商品进行召回
+    for i in cateId_list.head(10):
+        need = 500 - len(ret)
+        ret = ret.union(np.random.choice(ad_cate_df[ad_cate_df['cateId'] == i.cateId].adgroupId.dropna().\
+                                         astype(np.string_), need))
+        if len(ret) > 500:
+            break
+    # 缓存到redis中
+    client.sadd(userId, *ret)
+```
+
+7.同理，根据以上步骤可以进行用户对广告品牌brand偏好打分训练ALS模型，并召回相关的结果进行缓存
+
+### 基于用户的点击日志数据和基本特征信息，离线训练LR点击率预估模型并保存
+1.从hdfs中加载raw_sample.csv数据，并对pid字段进行独热编码
+```
+from pyspark.ml.feature import StringIndexer, OneHotEncoder
+from pyspark.ml import Pipeline
+# 从hdfs中加载raw_sample.csv数据
+schema = StructType([
+    StructField("user", IntegerType()),
+    StructField("time_stamp", LongType()),
+    StructField("adgroup_id", IntegerType()),
+    StructField("pid", StringType()),
+    StructField("nonclk", IntegerType()),
+    StructField("clk", IntegerType())
+])
+df = spark.read.csv("hdfs://localhost:9000/recsys/dataset/raw_sample.csv", header=True, schema=schema)
+# 更改表结构，转换列名
+new_df = df.withColumnRenamed("user", "userId").withColumnRenamed("time_stamp", "timestamp").\
+    withColumnRenamed("adgroup_id", "adgroupId")
+# 利用StringIndexer对指定字符串列进行类别编码处理
+stringindexer = StringIndexer(inputCol='pid', outputCol='pid_feature')
+# 进行OneHot独热编码
+encoder = OneHotEncoder(dropLast=False, inputCol='pid_feature', outputCol='pid_value')
+# 利用管道对数据进行OneHot编码处理
+pipeline = Pipeline(stages=[stringindexer, encoder])
+pipeline_model = pipeline.fit(new_df)
+raw_sample_df = pipeline_model.transform(new_df)
+```
+
+2.加载用户和广告的基本特征信息，并对pvalue_level和new_user_class_level字段进行独热编码
+```
+# 加载ad_feature.csv数据
+schema = StructType([
+    StructField("adgroup_id", IntegerType()),
+    StructField("cate_id", LongType()),
+    StructField("campaign_id", IntegerType()),
+    StructField("customer", IntegerType()),
+    StructField("brand", IntegerType()),
+    StructField("price", FloatType())
+])
+df = spark.read.csv("hdfs://localhost:9000/recsys/dataset/ad_feature.csv", header=True, schema=schema)
+df = df.replace("NULL", "-1")
+ad_feature_df = df.withColumnRenamed("adgroup_id", "adgroupId").withColumnRenamed("cate_id", "cateId").\
+    withColumnRenamed("campaign_id", "campaignId").withColumnRenamed("customer", "customerId").\
+    withColumnRenamed("brand", "brandId")
+
+# 加载user_profile数据
+schema = StructType([
+    StructField("userId", IntegerType()),
+    StructField("cms_segid", LongType()),
+    StructField("cms_group_id", IntegerType()),
+    StructField("final_gender_code", IntegerType()),
+    StructField("age_level", IntegerType()),
+    StructField("pvalue_level", StringType()),
+    StructField("shopping_level", IntegerType()),
+    StructField("occupation", IntegerType()),
+    StructField("new_user_class_level", StringType())
+])
+df = spark.read.csv("hdfs://localhost:9000/recsys/dataset/user_profile.csv", header=True, schema=schema)
+df = df.na.fill("-1")
+# 对pvalue_level进行onehot编码
+stringindexer = StringIndexer(inputCol="pvalue_level", outputCol="pl_onehot_feature")
+encoder = OneHotEncoder(dropLast=False, inputCol="pl_onehot_feature", outputCol="pl_onehot_value")
+pipeline = Pipeline(stages=[stringindexer, encoder])
+pipeline_model = pipeline.fit(df)
+new_df = pipeline_model.transform(df)
+# 对new_user_class_level进行onehot编码
+stringindexer = StringIndexer(inputCol="new_user_class_level", outputCol="nucl_onehot_feature")
+encoder = OneHotEncoder(dropLast=False, inputCol="nucl_onehot_feature", outputCol="nucl_onehot_value")
+pipeline = Pipeline(stages=[stringindexer, encoder])
+pipeline_model = pipeline.fit(new_df)
+user_profile_df = pipeline_model.transform(new_df)
+```
+
+3.进行数据合并，剔除冗余特征
+```
+# 进行数据合并
+condition = [raw_sample_df.adgroupId == ad_feature_df.adgroupId]
+_ = raw_sample_df.join(ad_feature_df, condition, 'outer')
+condition = [_.userId == user_profile_df.userId]
+dataset = _.join(user_profile_df, condition, 'outer')
+# 剔除冗余的字段
+useful_cols = ["timestamp", "clk", "pid_value", "price", "cms_segid", "cms_group_id", "final_gender_code", "age_level",
+               "shopping_level", "occupation", "pl_onehot_value", "nucl_onehot_value"]
+df_data = dataset.select(*useful_cols)
+df_data = df_data.dropna()
+```
+
+4.根据特征字段计算特征向量，划分训练集和测试集
+```
+from pyspark.ml.feature import VectorAssembler
+# 根据特征字段计算特征向量
+df_data = VectorAssembler().setInputCols(useful_cols[2:]).setOutputCol("features").transform(df_data)
+# 根据时间划分数据集，将前7天数据作为训练集，最后一天作为测试集
+train_data = df_data.filter(df_data.timestamp <= (1494691186-24*60*60))
+test_data = df_data.filter(df_data.timestamp > (1494691186-24*60*60))
+```
+
+5.创建LR模型，离线训练并保存
+```
+# 创建逻辑回归模型，进行模型训练并保存模型
+lr = LogisticRegression()
+model = lr.setLabelCol("clk").setFeaturesCol("features").fit(train_data)
+model.save("hdfs://localhost:9000/recsys/models/CTRModel_Normal.obj")
+```
 
 
