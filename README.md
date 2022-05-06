@@ -285,10 +285,164 @@ test_data = df_data.filter(df_data.timestamp > (1494691186-24*60*60))
 
 5.创建LR模型，离线训练并保存
 ```
+from pyspark.ml.classification import LogisticRegression
 # 创建逻辑回归模型，进行模型训练并保存模型
 lr = LogisticRegression()
 model = lr.setLabelCol("clk").setFeaturesCol("features").fit(train_data)
 model.save("hdfs://localhost:9000/recsys/models/CTRModel_Normal.obj")
 ```
 
+### 基于用户召回的候选广告进行LR点击率预测排序，为用户推荐top-n个物品（在线推荐模块）
+1.先将用户和广告的基本特征信息缓存到redis中
+- 缓存广告特征
+```
+import json
+import redis
+def store_ad_redis(partition):
+    client = redis.StrictRedis(host="localhost", port=6379, password="123456", db=10)
+    for r in partition:
+        data = {"price": r.price}
+        # 转为json字符串保存
+        client.hsetnx("ad_features", r.adgroupId, json.dumps(data))
+# 加载ad_feature.csv数据
+schema = StructType([
+    StructField("adgroup_id", IntegerType()),
+    StructField("cate_id", IntegerType()),
+    StructField("campaign_id", IntegerType()),
+    StructField("customer", IntegerType()),
+    StructField("brand", IntegerType()),
+    StructField("price", FloatType())
+])
+df = spark.read.csv("hdfs://localhost:9000/recsys/dataset/ad_feature.csv", header=True, schema=schema)
+df = df.replace("NULL", "-1")
+ad_feature_df = df.withColumnRenamed("adgroup_id", "adgroupId").withColumnRenamed("cate_id", "cateId").\
+    withColumnRenamed("campaign_id", "campaignId").withColumnRenamed("customer", "customerId").\
+    withColumnRenamed("brand", "brandId")
+# 缓存到redis中
+ad_feature_df.foreachPartition(store_ad_redis)
+```
+- 缓存用户特征
+```
+def store_user_redis(partition):
+    client = redis.StrictRedis(host="localhost", port=6379, password="123456", db=10)
+    for r in partition:
+        data = {
+            "cms_segid": r.cms_segid,
+            "cms_group_id": r.cms_group_id,
+            "final_gender_code": r.final_gender_code,
+            "age_level": r.age_level,
+            "shopping_level": r.shopping_level,
+            "occupation": r.occupation,
+            "pvalue_level": r.pvalue_level,
+            "new_user_class_level": r.new_user_class_level
+        }
+        # 转为json字符串保存
+        client.hsetnx("user_features", r.userId, json.dumps(data))
+# 加载user_profile数据
+schema = StructType([
+    StructField("userId", IntegerType()),
+    StructField("cms_segid", IntegerType()),
+    StructField("cms_group_id", IntegerType()),
+    StructField("final_gender_code", IntegerType()),
+    StructField("age_level", IntegerType()),
+    StructField("pvalue_level", IntegerType()),
+    StructField("shopping_level", IntegerType()),
+    StructField("occupation", IntegerType()),
+    StructField("new_user_class_level", IntegerType())
+])
+user_profile_df = spark.read.csv("hdfs://localhost:9000/recsys/dataset/user_profile.csv", header=True, schema=schema)
+# 缓存到redis中
+user_profile_df.foreachPartition(store_user_redis)
+```
 
+2.初始化并启动推荐系统，包括创建spark session、建立redis客户端连接、加载训练好的CTR预测模型等操作
+```
+# 创建spark session
+conf = SparkConf()
+config = [
+    ("spark.app.name", self.SPARK_APP_NAME),
+    ("spark.executor.memory", "10g"),
+    ("spark.master", self.SPARK_URL),
+    ("spark.executor.cores", "3")
+]
+conf.setAll(config)
+spark = SparkSession.builder.config(conf=conf).getOrCreate()
+
+# 建立redis客户端连接
+client_of_recall = redis.StrictRedis(host="localhost", port=6379, password="123456", db=9)
+client_of_features = redis.StrictRedis(host="localhost", port=6379, password="123456", db=10)
+
+from pyspark.ml.classification import LogisticRegressionModel
+# 加载训练好的CTR预测模型
+CTR_model = LogisticRegressionModel.load(self.MODEL_PATH)
+```
+
+3.根据输入的用户ID和广告资源位置ID，创建模型的输入数据集
+```
+def create_dataset(self, user_id, pid):
+    """创建LR排序模型的输入数据集"""
+    # 从redis缓存中获取用户特征和召回物品
+    user_feature = json.loads(self.client_of_features.hget("user_features", user_id).decode())
+    recall_sets = self.client_of_recall.smembers(user_id)
+    result = []
+
+    # 遍历召回物品集合
+    for adgroupId in recall_sets:
+        # 获取广告特征
+        adgroupId = int(adgroupId)
+        ad_feature = json.loads(self.client_of_features.hget("ad_features", adgroupId).decode())
+        # 合并用户和广告特征
+        features = {}
+        features.update(user_feature)
+        features.update(ad_feature)
+        for k, v in features.items():
+            if v is None:
+                features[k] = -1
+
+        features_col = ["price", "cms_segid", "cms_group_id", "final_gender_code", "age_level", "shopping_level",
+                        "occupation", "pid", "pvalue_level", "new_user_class_level"]
+        price = float(features["price"])
+        cms = features["cms_segid"]
+        cms_group_id = features["cms_group_id"]
+        final_gender_code = features["final_gender_code"]
+        age_level = features["age_level"]
+        shopping_level = features["shopping_level"]
+        occupation = features["occupation"]
+
+        pid_value = [0 for i in range(2)]
+        pvalue_level_value = [0 for i in range(4)]
+        new_user_class_level_value = [0 for i in range(5)]
+        pid_value[self.pid_rela[pid]] = 1
+        pvalue_level_value[self.pvalue_level_rela[int(features["pvalue_level"])]] = 1
+        new_user_class_level_value[self.new_user_class_level_rela[int(features["new_user_class_level"])]] = 1
+
+        vector = DenseVector(pid_value + [price, cms, cms_group_id, final_gender_code, age_level, shopping_level,
+                             occupation] + pvalue_level_value + new_user_class_level_value)
+
+        result.append((user_id, adgroupId, vector))
+    return result
+```
+
+4.利用训练好的模型预测广告的点击率，返回用户最有可能点击的前N个广告ID
+```
+pdf = pd.DataFrame(create_dataset(user_id, pid), columns=["userId", "adgroupId", "features"])
+dataset = spark.createDataFrame(pdf)
+prediction = CTR_model.transform(dataset).sort("probability")
+result = [i.adgroupId for i in prediction.select("adgroupId").head(n)]  # n为需要推荐的广告个数
+```
+
+5.项目最终命令行运行效果如下：
+```
+推荐系统正在启动...
+推荐系统启动成功.
+请输入用户ID：8
+请输入广告资源位（输入1（默认）：430548_1007 | 输入2：430549_1007）：1
+请输入需要推荐的广告个数（默认10，最大500）：10
+给用户8推荐的广告ID列表为： [525832, 417674, 832203, 510906, 372559, 194931, 484955, 298084, 548724, 597820]
+继续请输入1，否则输入其他任意键退出：1
+请输入用户ID：268
+请输入广告资源位（输入1（默认）：430548_1007 | 输入2：430549_1007）：2
+请输入需要推荐的广告个数（默认10，最大500）：5
+给用户268推荐的广告ID列表为： [510344, 192802, 42109, 754158, 305992]
+继续请输入1，否则输入其他任意键退出：
+```
